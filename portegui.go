@@ -198,13 +198,13 @@ import (
 )
 
 var (
-	db        *sql.DB
-	logs      [][]string
-	mu        sync.Mutex
-	udpConn   *net.UDPConn
-	arduinoIP = "10.216.41.144:8888"
-
-	// Anti-spam : stockage du dernier passage par UID
+	db               *sql.DB
+	logs             [][]string
+	mu               sync.Mutex
+	udpConn          *net.UDPConn
+	arduinoIP        = "10.216.41.144:8888"
+	isSpeaking       bool
+	muSpeech         sync.Mutex
 	derniersPassages = make(map[string]time.Time)
 	muPassage        sync.Mutex
 
@@ -215,34 +215,132 @@ var (
 	roles      = []string{"Porte 1", "Toute", "None"}
 )
 
-func parler(msg string) {
-	ps := fmt.Sprintf(`Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('%s')`, msg)
-	exec.Command("powershell", "-Command", ps).Start()
+func main() {
+	var err error
+	db, err = sql.Open("sqlite3", "./securite.db?_journal_mode=WAL")
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+
+	db.Exec("CREATE TABLE IF NOT EXISTS utilisateurs (uid TEXT PRIMARY KEY, nom TEXT, role TEXT)")
+	db.Exec("CREATE TABLE IF NOT EXISTS historique (date TEXT, heure TEXT, nom TEXT, uid TEXT, statut TEXT)")
+
+	chargerLogs()
+	go startUDPServer()
+
+	wnd := giu.NewMasterWindow("RFID Dashboard - Pro", 850, 600, 0)
+	wnd.Run(loop)
 }
 
-func ajouterUtilisateur(uid, nom, role string) {
-	u := strings.ToUpper(strings.TrimSpace(uid))
-	n := strings.TrimSpace(nom)
-	if u == "" || n == "" {
+func loop() {
+	giu.SingleWindow().Layout(
+		giu.Label("GESTION DES ACCÈS RFID"),
+		giu.Separator(),
+		giu.Label("AJOUTER UN BADGE"),
+		giu.Row(
+			giu.Label("UID:"), giu.InputText(&newUID).Size(120),
+			giu.Label("Nom:"), giu.InputText(&newNom).Size(150),
+			giu.Combo("Role", roles[newRoleIdx], roles, &newRoleIdx).Size(100),
+			giu.Button("ENREGISTRER").OnClick(func() {
+				ajouterUtilisateur(newUID, newNom, roles[newRoleIdx])
+			}),
+		),
+		giu.Separator(),
+		giu.Label("COMMANDES MANUELLES"),
+		giu.Row(
+			giu.Button("OUVRIR PORTE 1").OnClick(func() {
+				sendUDP("OPEN1\n", nil)
+				enregistrerLog("ADMIN", "BOUTON", "P1")
+				go lancerParole("Ouverture porte un manuelle")
+			}),
+			giu.Button("TOUT OUVRIR").OnClick(func() {
+				sendUDP("BOTH\n", nil)
+				enregistrerLog("ADMIN", "BOUTON", "TOUT")
+				go lancerParole("Ouverture totale manuelle")
+			}),
+		),
+		giu.Separator(),
+		giu.Table().Flags(giu.TableFlagsResizable|giu.TableFlagsRowBg|giu.TableFlagsBorders).Columns(
+			giu.TableColumn("DATE"), giu.TableColumn("HEURE"),
+			giu.TableColumn("NOM"), giu.TableColumn("UID"), giu.TableColumn("STATUT"),
+		).Rows(buildRows()...),
+	)
+}
+
+// --- LOGIQUE D'ACCÈS (AVEC TEMPS D'ATTENTE 1 MINUTE) ---
+
+func handleAccess(uid string, addr *net.UDPAddr) {
+	// 1. Vérification Anti-spam (1 minute)
+	muPassage.Lock()
+	dernierTemps, existe := derniersPassages[uid]
+	muPassage.Unlock()
+
+	if existe && time.Since(dernierTemps) < 60*time.Second {
+		reste := int(60 - time.Since(dernierTemps).Seconds())
+		go lancerParole(fmt.Sprintf("Veuillez patienter %d secondes.", reste))
 		return
 	}
-	_, err := db.Exec("INSERT OR REPLACE INTO utilisateurs (uid, nom, role) VALUES (?, ?, ?)", u, n, role)
-	if err == nil {
-		fmt.Printf("Enregistré: %s (%s) - Role: %s\n", n, u, role)
-		newUID = ""
-		newNom = ""
+
+	// 2. Vérification Verrou Vocal
+	muSpeech.Lock()
+	if isSpeaking {
+		muSpeech.Unlock()
+		sendUDP("DENY\n", addr)
+		go lancerParole("Système occupé, un instant s'il vous plaît.")
+		return
 	}
+	isSpeaking = true
+	muSpeech.Unlock()
+
+	// 3. Traitement Base de données
+	var nomDb, roleDb string
+	err := db.QueryRow("SELECT nom, role FROM utilisateurs WHERE uid = ?", uid).Scan(&nomDb, &roleDb)
+
+	cmd, status, nom := "DENY\n", "REFUSE", "Inconnu"
+	msgVocal := ""
+
+	if err == nil {
+		nom = nomDb
+		if roleDb == "Toute" || roleDb == "ALL" {
+			cmd, status = "BOTH\n", "ACCÈS TOTAL"
+		} else {
+			cmd, status = "OPEN1\n", "ACCÈS P1"
+		}
+		msgVocal = "Bonjour " + nom + ". Accès autorisé."
+
+		muPassage.Lock()
+		derniersPassages[uid] = time.Now()
+		muPassage.Unlock()
+	} else {
+		msgVocal = "Badge inconnu. Accès refusé."
+	}
+
+	// 4. Exécution
+	sendUDP(cmd, addr)
+	enregistrerLog(nom, uid, status)
+
+	go func() {
+		exécuterParoleSync(msgVocal)
+		muSpeech.Lock()
+		isSpeaking = false
+		muSpeech.Unlock()
+	}()
 }
 
-func enregistrerLog(nom, uid, statut string) {
-	heure := time.Now().Format("15:04:05")
-	db.Exec("INSERT INTO historique VALUES (?, ?, ?, ?)", heure, nom, uid, statut)
-	mu.Lock()
-	logs = append([][]string{{heure, nom, uid, statut}}, logs...)
-	if len(logs) > 50 {
-		logs = logs[:50]
-	}
-	mu.Unlock()
+// --- FONCTIONS SYSTÈME ET UTILITAIRES ---
+
+func exécuterParoleSync(msg string) {
+	cleanMsg := strings.ReplaceAll(msg, "'", " ")
+	ps := fmt.Sprintf(`Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('%s')`, cleanMsg)
+	_ = exec.Command("powershell", "-Command", ps).Run()
+}
+
+func lancerParole(msg string) {
+	// Version non-bloquante pour les messages d'erreur rapides
+	cleanMsg := strings.ReplaceAll(msg, "'", " ")
+	ps := fmt.Sprintf(`Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('%s')`, cleanMsg)
+	_ = exec.Command("powershell", "-Command", ps).Start()
 }
 
 func sendUDP(msg string, target *net.UDPAddr) {
@@ -252,61 +350,6 @@ func sendUDP(msg string, target *net.UDPAddr) {
 	if udpConn != nil && target != nil {
 		udpConn.WriteToUDP([]byte(msg), target)
 	}
-}
-
-func handleAccess(uid string, addr *net.UDPAddr) {
-	// 1. Vérification du délai de 30 secondes
-	muPassage.Lock()
-	dernierTemps, existe := derniersPassages[uid]
-	muPassage.Unlock()
-
-	if existe && time.Since(dernierTemps) < 30*time.Second {
-		reste := int(30 - time.Since(dernierTemps).Seconds())
-		go parler(fmt.Sprintf("Veuillez attendre %d secondes", reste))
-		return
-	}
-
-	// 2. Recherche en base de données
-	var nomDb, roleDb string
-	err := db.QueryRow("SELECT nom, role FROM utilisateurs WHERE uid = ?", uid).Scan(&nomDb, &roleDb)
-
-	cmd, status, nom := "DENY\n", "REFUSE", "Inconnu"
-
-	if err == nil {
-		nom = nomDb
-		// Logique des rôles (supporte les anciens P1/ALL et nouveaux Porte 1/Toute)
-		if roleDb == "Porte 1" || roleDb == "P1" {
-			status = "ACCÈS P1"
-			cmd = "OPEN1\n"
-		} else if roleDb == "Toute" || roleDb == "ALL" {
-			status = "ACCÈS TOTAL"
-			cmd = "BOTH\n"
-		} else {
-			status = "NONE (REFUS)"
-			cmd = "DENY\n"
-		}
-
-		// Si accès accordé, on met à jour le chrono anti-spam
-		if strings.Contains(status, "ACCÈS") {
-			muPassage.Lock()
-			derniersPassages[uid] = time.Now()
-			muPassage.Unlock()
-		}
-	}
-
-	sendUDP(cmd, addr)
-
-	// Heure fluide pour la voix
-	heureVoix := time.Now().Format("15") + " heures " + time.Now().Format("04")
-
-	go func() {
-		enregistrerLog(nom, uid, status)
-		if strings.Contains(status, "ACCÈS") {
-			parler("Bonjour " + nom + ". Il est " + heureVoix + ". Accès autorisé.")
-		} else {
-			parler("Accès refusé.")
-		}
-	}()
 }
 
 func startUDPServer() {
@@ -323,65 +366,56 @@ func startUDPServer() {
 	}
 }
 
-func loop() {
-	giu.Window("Sécurité RFID").Size(850, 600).Layout(
-		giu.Label("AJOUTER UN BADGE"),
-		giu.Row(
-			giu.Label("UID:"), giu.InputText(&newUID).Size(120),
-			giu.Label("Nom:"), giu.InputText(&newNom).Size(150),
-			giu.Label("Role:"), giu.Combo("", roles[newRoleIdx], roles, &newRoleIdx).Size(100),
-			giu.Button("ENREGISTRER").OnClick(func() {
-				ajouterUtilisateur(newUID, newNom, roles[newRoleIdx])
-			}),
-		),
-		giu.Separator(),
-		giu.Label("COMMANDES MANUELLES"),
-		giu.Row(
-			giu.Button("OUVRIR PORTE 1").OnClick(func() {
-				sendUDP("OPEN1\n", nil)
-				go func() {
-					h := time.Now().Format("15") + " heures " + time.Now().Format("04")
-					enregistrerLog("ADMIN", "BOUTON", "P1")
-					parler("Ouverture porte 1. Il est " + h)
-				}()
-			}),
-			giu.Button("TOUT OUVRIR").OnClick(func() {
-				sendUDP("BOTH\n", nil)
-				go func() {
-					h := time.Now().Format("15") + " heures " + time.Now().Format("04")
-					enregistrerLog("ADMIN", "BOUTON", "TOUT")
-					parler("Ouverture totale. Il est " + h)
-				}()
-			}),
-		),
-		giu.Separator(),
-		giu.Table().Columns(
-			giu.TableColumn("HEURE"), giu.TableColumn("NOM"),
-			giu.TableColumn("UID"), giu.TableColumn("STATUT"),
-		).Rows(buildRows()...),
-	)
-}
-
 func buildRows() []*giu.TableRowWidget {
 	mu.Lock()
 	defer mu.Unlock()
 	rows := make([]*giu.TableRowWidget, len(logs))
 	for i, l := range logs {
-		rows[i] = giu.TableRow(giu.Label(l[0]), giu.Label(l[1]), giu.Label(l[2]), giu.Label(l[3]))
+		rows[i] = giu.TableRow(giu.Label(l[0]), giu.Label(l[1]), giu.Label(l[2]), giu.Label(l[3]), giu.Label(l[4]))
 	}
 	return rows
 }
 
-func main() {
-	var err error
-	db, err = sql.Open("sqlite3", "./securite.db?_journal_mode=DELETE&_sync=FULL")
+func ajouterUtilisateur(uid, nom, role string) {
+	u := strings.ToUpper(strings.TrimSpace(uid))
+	n := strings.TrimSpace(nom)
+	if u == "" || n == "" {
+		return
+	}
+	db.Exec("INSERT OR REPLACE INTO utilisateurs (uid, nom, role) VALUES (?, ?, ?)", u, n, role)
+	newUID, newNom = "", ""
+	giu.Update()
+}
+
+func chargerLogs() {
+	rows, _ := db.Query("SELECT date, heure, nom, uid, statut FROM historique ORDER BY rowid DESC LIMIT 50")
+	if rows != nil {
+		defer rows.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for rows.Next() {
+			var d, h, n, u, s string
+			rows.Scan(&d, &h, &n, &u, &s)
+			logs = append(logs, []string{d, h, n, u, s})
+		}
+	}
+}
+
+func enregistrerLog(nom, uid, statut string) {
+	d := time.Now().Format("02/01/2006")
+	h := time.Now().Format("15:04:05")
+
+	// On précise (date, heure, nom, uid, statut) pour que SQLite sache où mettre chaque info
+	_, err := db.Exec("INSERT INTO historique (date, heure, nom, uid, statut) VALUES (?, ?, ?, ?, ?)", d, h, nom, uid, statut)
 	if err != nil {
-		panic(err)
+		fmt.Println("Erreur DB:", err)
 	}
 
-	db.Exec("CREATE TABLE IF NOT EXISTS utilisateurs (uid TEXT PRIMARY KEY, nom TEXT, role TEXT)")
-	db.Exec("CREATE TABLE IF NOT EXISTS historique (heure TEXT, nom TEXT, uid TEXT, statut TEXT)")
-
-	go startUDPServer()
-	giu.NewMasterWindow("RFID Dashboard", 850, 600, 0).Run(loop)
+	mu.Lock()
+	logs = append([][]string{{d, h, nom, uid, statut}}, logs...)
+	if len(logs) > 50 {
+		logs = logs[:50]
+	}
+	mu.Unlock()
+	giu.Update()
 }
